@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 import psutil
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from peft import LoraConfig, TaskType, get_peft_model
 from tqdm import tqdm
 
@@ -99,16 +99,22 @@ class TorchTracemalloc:
         self.cpu_peaked = b2mb(self.cpu_peak - self.cpu_begin)
         # print(f"delta used/peak {self.used:4d}/{self.peaked:4d}")
 
+def format_dataset_1(example):
+    return {'input': 'translate to SQL: ' + example['question'], 'target': example['sql']['human_readable'].replace('\n','').replace('``', '').replace('"', '')}
+
+def format_dataset_2(example):
+    return {'input': 'translate to English: ' + example['sql']['human_readable'], 'target': example['question'] }
 
 def main():
     accelerator = Accelerator()
     model_name_or_path = "bigscience/T0_3B"
-    dataset_name = "twitter_complaints"
+    # dataset_name = "twitter_complaints"
+    dataset_name = "wikisql"
     peft_config = LoraConfig(
         task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=8, lora_alpha=32, lora_dropout=0.1
     )
-    text_column = "Tweet text"
-    label_column = "text_label"
+    text_column = "question"
+    label_column = "sql"
     lr = 3e-3
     num_epochs = 5
     batch_size = 8
@@ -116,43 +122,65 @@ def main():
     do_test = False
     set_seed(seed)
 
-    dataset = load_dataset("ought/raft", dataset_name)
-    classes = [k.replace("_", " ") for k in dataset["train"].features["Label"].names]
-    dataset = dataset.map(
-        lambda x: {"text_label": [classes[label] for label in x["Label"]]},
-        batched=True,
-        num_proc=1,
-    )
+    dataset = load_dataset(dataset_name)#"ought/raft", dataset_name)
+    dataset_2 = load_dataset(dataset_name)
+    # classes = [k.replace("_", " ") for k in dataset["train"].features["Label"].names]
+    dataset = dataset.map(format_dataset_1, remove_columns=dataset['train'].column_names)
+    dataset_2 = dataset_2.map(format_dataset_2, remove_columns=dataset_2['train'].column_names)
 
+    train_data = concatenate_datasets([dataset['train'], dataset_2['train'], dataset['validation'], dataset_2['validation']]).shuffle(seed=42)
+    test_data = concatenate_datasets([dataset['test'], dataset_2['test']]).shuffle(seed=42)
+    
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    target_max_length = max([len(tokenizer(class_label)["input_ids"]) for class_label in classes])
+    # target_max_length = max([len(tokenizer(class_label)["input_ids"]) for class_label in classes])
 
-    def preprocess_function(examples):
-        inputs = examples[text_column]
-        targets = examples[label_column]
-        model_inputs = tokenizer(inputs, truncation=True)
-        labels = tokenizer(
-            targets, max_length=target_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        labels = labels["input_ids"]
-        labels[labels == tokenizer.pad_token_id] = -100
-        model_inputs["labels"] = labels
-        return model_inputs
+    def preprocess_function(example_batch):
+        # inputs = examples[text_column]
+        # targets = examples[label_column]
+        # model_inputs = tokenizer(inputs, truncation=True)
+        # labels = tokenizer(
+        #     targets, max_length=target_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        # )
+        # labels = labels["input_ids"]
+        # labels[labels == tokenizer.pad_token_id] = -100
+        # model_inputs["labels"] = labels
+        input_encodings = tokenizer.batch_encode_plus(example_batch['input'], pad_to_max_length=True, max_length=64)
+        target_encodings = tokenizer.batch_encode_plus(example_batch['target'], pad_to_max_length=True, max_length=64)
+
+        encodings = {
+        'input_ids': input_encodings['input_ids'], 
+        'attention_mask': input_encodings['attention_mask'],
+        'labels': target_encodings['input_ids'],
+        'decoder_attention_mask': target_encodings['attention_mask']
+        }
+        return encodings#model_inputs
 
     with accelerator.main_process_first():
-        processed_datasets = dataset.map(
+        train_data = train_data.map(
             preprocess_function,
             batched=True,
             num_proc=1,
-            remove_columns=dataset["train"].column_names,
+            remove_columns=train_data.column_names,
             load_from_cache_file=True,
             desc="Running tokenizer on dataset",
         )
+        test_data = test_data.map(
+            preprocess_function,
+            batched=True,
+            num_proc=1,
+            remove_columns=test_data.column_names,
+            load_from_cache_file=True,
+            desc="Running tokenizer on dataset",
+        )
+        columns = ['input_ids', 'attention_mask', 'labels', 'decoder_attention_mask']
+
+        train_data.set_format(type='torch', columns=columns)
+        test_data.set_format(type='torch', columns=columns)
     accelerator.wait_for_everyone()
 
-    train_dataset = processed_datasets["train"]
-    eval_dataset = processed_datasets["train"]
-    test_dataset = processed_datasets["test"]
+    train_dataset = train_data#processed_datasets["train"]
+    eval_dataset = train_data#processed_datasets["train"]
+    test_dataset = test_data#processed_datasets["test"]
 
     def collate_fn(examples):
         return tokenizer.pad(examples, padding="longest", return_tensors="pt")
